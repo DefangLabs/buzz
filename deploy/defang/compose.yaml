@@ -1,0 +1,132 @@
+name: buzz-relay
+
+# Deploy a Buzz relay to your own cloud (AWS / GCP / Azure / DigitalOcean) with
+# Defang (https://defang.io) — a Docker-Compose-compatible BYOC deployment that
+# runs entirely in your cloud account.
+#
+# How this differs from deploy/compose (single-node / VPS):
+#   * postgres -> Defang managed database   (x-defang-postgres; e.g. RDS on AWS)
+#   * redis    -> Defang managed cache        (x-defang-redis;    e.g. ElastiCache)
+#   * minio    -> your cloud's object store    (real S3/GCS/etc. via Buzz's native
+#                                               external-S3 support)
+#   * no volumes: Buzz's durable git state is object-store-backed, so the relay
+#                 keeps no persistent local state and needs no volumes.
+#   * caddy/TLS -> Defang's load balancer terminates TLS and gives the relay a
+#                  public HTTPS/WSS URL automatically.
+#
+# One-time setup (values are stored encrypted, injected at runtime):
+#   defang config set RELAY_OWNER_PUBKEY BUZZ_RELAY_PRIVATE_KEY \
+#     BUZZ_GIT_HOOK_HMAC_SECRET POSTGRES_PASSWORD DATABASE_URL \
+#     BUZZ_S3_ENDPOINT BUZZ_S3_REGION BUZZ_S3_BUCKET \
+#     BUZZ_S3_ACCESS_KEY BUZZ_S3_SECRET_KEY \
+#     RELAY_URL BUZZ_DOMAIN BUZZ_MEDIA_BASE_URL BUZZ_MEDIA_SERVER_DOMAIN \
+#     BUZZ_CORS_ORIGINS
+# then:  defang compose up
+#
+# See deploy/defang/README.md for the full walkthrough.
+
+services:
+  relay:
+    image: ${BUZZ_IMAGE:-ghcr.io/block/buzz:main}
+    restart: unless-stopped
+    ports:
+      - mode: ingress
+        target: 3000
+        published: 3000
+    environment:
+      BUZZ_BIND_ADDR: 0.0.0.0:3000
+      BUZZ_HEALTH_PORT: "8080"
+      BUZZ_METRICS_PORT: "9102"
+
+      # Closed community relay (owner + members).
+      BUZZ_REQUIRE_AUTH_TOKEN: "true"
+      BUZZ_REQUIRE_RELAY_MEMBERSHIP: "true"
+      BUZZ_ALLOW_NIP_OA_AUTH: "true"
+      BUZZ_AUTO_MIGRATE: "true"
+      BUZZ_GIT_CONFORMANCE_PROBE: "true"
+      RUST_LOG: "buzz_relay=info,buzz_db=info,buzz_auth=info,buzz_pubsub=info,tower_http=info"
+
+      # Managed cache (ElastiCache/etc.) — reachable in-VPC on the service name.
+      REDIS_URL: redis://redis:6379
+
+      BUZZ_S3_ADDRESSING_STYLE: virtual
+      BUZZ_GIT_REPO_PATH: /data/git
+
+      # ---- injected from `defang config` (blank = supplied at deploy time) ----
+      # Public URL / identity.
+      RELAY_URL:
+      BUZZ_DOMAIN:
+      BUZZ_MEDIA_BASE_URL:
+      BUZZ_MEDIA_SERVER_DOMAIN:
+      BUZZ_CORS_ORIGINS:
+      # Owner + stable relay secrets.
+      RELAY_OWNER_PUBKEY:
+      BUZZ_RELAY_PRIVATE_KEY:
+      BUZZ_GIT_HOOK_HMAC_SECRET:
+      # Managed database connection string (contains the DB password).
+      DATABASE_URL:
+      # Object storage (e.g. AWS S3: BUZZ_S3_ENDPOINT=https://s3.<region>.amazonaws.com).
+      BUZZ_S3_ENDPOINT:
+      BUZZ_S3_REGION:
+      BUZZ_S3_BUCKET:
+      BUZZ_S3_ACCESS_KEY:
+      BUZZ_S3_SECRET_KEY:
+    healthcheck:
+      # Defang configures the load-balancer health check from this URL. The relay
+      # serves /_liveness on the main port 3000 (no auth). The runtime image has
+      # no curl, so an equivalent bash /dev/tcp probe runs the in-container check.
+      test:
+        - CMD-SHELL
+        - "curl -fsS http://localhost:3000/_liveness || bash -c 'exec 3<>/dev/tcp/127.0.0.1/3000; printf \"GET /_liveness HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3; grep -q \"200 OK\" <&3'"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    deploy:
+      resources:
+        reservations:
+          cpus: "0.5"
+          memory: 1024M
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17
+    x-defang-postgres: true
+    restart: unless-stopped
+    ports:
+      - mode: host
+        target: 5432
+    environment:
+      POSTGRES_USER: buzz
+      POSTGRES_DB: buzz
+      POSTGRES_PASSWORD:
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U buzz -d buzz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        reservations:
+          cpus: "0.5"
+          memory: 1024M
+
+  redis:
+    # Defang derives the managed-cache engine version from the image tag; use
+    # <major>.<minor> (a bare "7" is rejected by ElastiCache).
+    image: redis:7.1
+    x-defang-redis: true
+    restart: unless-stopped
+    ports:
+      - mode: host
+        target: 6379
+    deploy:
+      resources:
+        reservations:
+          cpus: "0.25"
+          memory: 512M
